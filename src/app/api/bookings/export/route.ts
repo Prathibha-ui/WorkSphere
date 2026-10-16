@@ -2,7 +2,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@clerk/nextjs/server";
 import { prisma } from "@/lib/prisma";
 import { ensureUserExists } from "@/lib/auth";
-import { bookingsToCSV } from "@/lib/pdfHelpers";
+import {
+  bookingsToCSV,
+  exportBookingsToJson,
+} from "@/lib/pdfHelpers";
 import { resolveDateRange, filterBookingsByRange } from "@/lib/taxExport";
 import { generateTaxExportPdf } from "@/lib/pdfGenerator";
 
@@ -17,9 +20,9 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     const { bookingIds, format, taxYear, startDate, endDate } = body;
 
-    if (format !== "pdf" && format !== "csv") {
-      return NextResponse.json({ error: "Invalid format" }, { status: 400 });
-    }
+    if (!["pdf", "csv", "json"].includes(format)) {
+  return NextResponse.json({ error: "Invalid format" }, { status: 400 });
+}
 
     const usingDateRange = !bookingIds && (taxYear || (startDate && endDate));
 
@@ -77,6 +80,18 @@ export async function POST(req: NextRequest) {
         },
       });
     }
+    if (format === "json") {
+  const json = exportBookingsToJson(bookings);
+
+  return new NextResponse(json, {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Content-Disposition": `attachment; filename="WorkSphere_Tax_Export_${Date.now()}.json"`,
+      "Cache-Control": "no-cache",
+    },
+  });
+}
 
     const pdfBytes = await generateTaxExportPdf(bookings);
     return new NextResponse(Buffer.from(pdfBytes), {
