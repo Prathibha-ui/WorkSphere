@@ -12,6 +12,7 @@ import { rateLimit, getRateLimitInfo } from "@/lib/rateLimit";
 import { ensureUserExists } from "@/lib/auth";
 import { emitWebhookEvent } from "@/lib/webhooks/deliver";
 import { sanitizeSearchQuery, splitSearchList } from "@/lib/searchSanitizer";
+import { getFuzzyThreshold, isFuzzyMatch } from "@/lib/search/fuzzySearch";
 import {
   indexVenueSearchEmbedding,
   searchVenuesWithRrf,
@@ -24,6 +25,32 @@ import {
 // burst-tolerant ceiling — generous enough for fast typing, still low enough to stop
 // scripted abuse. See #717.
 const VENUE_SEARCH_RATE_LIMIT = 60;
+
+function suggestVenueQuery(
+  query: string,
+  venueNames: string[],
+): string | undefined {
+  const trimmedQuery = query.trim();
+  const threshold = getFuzzyThreshold(trimmedQuery.length);
+  if (!trimmedQuery || threshold === 0) return undefined;
+
+  let suggestion: string | undefined;
+  let closestDistance = threshold + 1;
+
+  for (const name of venueNames) {
+    const match = isFuzzyMatch(trimmedQuery, name, threshold);
+    if (
+      match.matched &&
+      match.distance > 0 &&
+      match.distance < closestDistance
+    ) {
+      suggestion = name;
+      closestDistance = match.distance;
+    }
+  }
+
+  return suggestion;
+}
 
 interface VenueSearchData {
   lat: number;
@@ -108,7 +135,12 @@ export async function GET(req: NextRequest) {
       const where: any = {};
       const andConditions: any[] = [];
 
-      if (minLatParam !== null && !isNaN(Number(minLatParam)) && maxLatParam !== null && !isNaN(Number(maxLatParam))) {
+      if (
+        minLatParam !== null &&
+        !isNaN(Number(minLatParam)) &&
+        maxLatParam !== null &&
+        !isNaN(Number(maxLatParam))
+      ) {
         andConditions.push({
           latitude: {
             gte: parseFloat(minLatParam),
@@ -124,7 +156,12 @@ export async function GET(req: NextRequest) {
         }
       }
 
-      if (minLngParam !== null && !isNaN(Number(minLngParam)) && maxLngParam !== null && !isNaN(Number(maxLngParam))) {
+      if (
+        minLngParam !== null &&
+        !isNaN(Number(minLngParam)) &&
+        maxLngParam !== null &&
+        !isNaN(Number(maxLngParam))
+      ) {
         andConditions.push({
           longitude: {
             gte: parseFloat(minLngParam),
@@ -149,6 +186,21 @@ export async function GET(req: NextRequest) {
             })),
           });
         }
+      }
+
+      const suggestionWhere =
+        andConditions.length === 1
+          ? andConditions[0]
+          : andConditions.length > 1
+            ? { AND: [...andConditions] }
+            : {};
+      if (queryParam) {
+        andConditions.push({
+          OR: [
+            { name: { contains: queryParam, mode: "insensitive" } },
+            { address: { contains: queryParam, mode: "insensitive" } },
+          ],
+        });
       }
 
       if (andConditions.length === 1) {
@@ -179,28 +231,37 @@ export async function GET(req: NextRequest) {
               : undefined,
           cities: citiesParam ? splitSearchList(citiesParam) : undefined,
           semanticWeight:
-            semanticWeightParam !== null && Number.isFinite(Number(semanticWeightParam))
+            semanticWeightParam !== null &&
+            Number.isFinite(Number(semanticWeightParam))
               ? Number(semanticWeightParam)
               : undefined,
           fullTextWeight:
-            fullTextWeightParam !== null && Number.isFinite(Number(fullTextWeightParam))
+            fullTextWeightParam !== null &&
+            Number.isFinite(Number(fullTextWeightParam))
               ? Number(fullTextWeightParam)
               : undefined,
         });
         const rankedIds = ranked.map(({ id }) => id);
+        // The ranking already matched the query (full-text, semantic or
+        // fuzzy); re-applying the literal name/address filter would drop
+        // every result that is not an exact substring match.
         const matchingVenues = rankedIds.length
           ? await prisma.venue.findMany({
-              where: { ...where, id: { in: rankedIds } },
+              where: { ...suggestionWhere, id: { in: rankedIds } },
               include: {
                 _count: { select: { favorites: true, ratings: true } },
                 foodValidations: true,
               },
             })
           : [];
-        const venueMap = new Map(matchingVenues.map((venue) => [venue.id, venue]));
+        const venueMap = new Map(
+          matchingVenues.map((venue) => [venue.id, venue]),
+        );
         const orderedVenues = rankedIds
           .map((id) => venueMap.get(id))
-          .filter((venue): venue is (typeof matchingVenues)[number] => Boolean(venue));
+          .filter((venue): venue is (typeof matchingVenues)[number] =>
+            Boolean(venue),
+          );
         const venues = orderedVenues.slice(skip, skip + limit);
         const total = orderedVenues.length;
 
@@ -238,8 +299,23 @@ export async function GET(req: NextRequest) {
           foodValidations: true,
         },
       });
+      const suggestedQuery =
+        venues.length === 0 && queryParam && typeof queryParam === "string"
+          ? suggestVenueQuery(
+              queryParam,
+              (
+                await prisma.venue.findMany({
+                  where: suggestionWhere,
+                  select: { name: true },
+                  orderBy: { rating: "desc" },
+                  take: 500,
+                })
+              ).map((venue) => venue.name),
+            )
+          : undefined;
       return NextResponse.json({
         venues,
+        ...(suggestedQuery && { suggestedQuery }),
         pagination: {
           page,
           limit,
@@ -478,14 +554,17 @@ export async function GET(req: NextRequest) {
         minLng: where.longitude?.gte,
         maxLng: where.longitude?.lte,
         category: where.category,
-        cities: rawData.cities ? splitSearchList(String(rawData.cities)) : undefined,
-      });
+        cities: rawData.cities
+          ? splitSearchList(String(rawData.cities))
+          : undefined,
         semanticWeight:
-          rawData.semanticWeight !== undefined && Number.isFinite(Number(rawData.semanticWeight))
+          rawData.semanticWeight !== undefined &&
+          Number.isFinite(Number(rawData.semanticWeight))
             ? Number(rawData.semanticWeight)
             : undefined,
         fullTextWeight:
-          rawData.fullTextWeight !== undefined && Number.isFinite(Number(rawData.fullTextWeight))
+          rawData.fullTextWeight !== undefined &&
+          Number.isFinite(Number(rawData.fullTextWeight))
             ? Number(rawData.fullTextWeight)
             : undefined,
       });
@@ -501,10 +580,14 @@ export async function GET(req: NextRequest) {
             },
           })
         : [];
-      const venueMap = new Map(matchingVenues.map((venue) => [venue.id, venue]));
+      const venueMap = new Map(
+        matchingVenues.map((venue) => [venue.id, venue]),
+      );
       const orderedVenues = rankedIds
         .map((id) => venueMap.get(id))
-        .filter((venue): venue is (typeof matchingVenues)[number] => Boolean(venue));
+        .filter((venue): venue is (typeof matchingVenues)[number] =>
+          Boolean(venue),
+        );
       total = orderedVenues.length;
       venues = orderedVenues.slice(skip, skip + limit);
     } else {
@@ -556,7 +639,6 @@ export async function GET(req: NextRequest) {
           id: true,
           name: true,
           address: true,
-          description: true,
         },
         take: 500,
       });
@@ -587,11 +669,17 @@ export async function GET(req: NextRequest) {
         } else {
           venues = [];
         }
+      } else {
+        suggestedQuery = suggestVenueQuery(
+          querySearch,
+          allCandidates.map((venue) => venue.name),
+        );
       }
     }
 
     return NextResponse.json({
       venues,
+      ...(suggestedQuery && { suggestedQuery }),
       pagination: {
         page,
         limit,
@@ -798,7 +886,9 @@ export async function POST(req: NextRequest) {
           ? "quiet focus concentration"
           : null,
         venue.hasNoMusic ? "no music silent" : null,
-        venue.dogFriendly || venue.petsAllowedIndoors ? "dog pet friendly" : null,
+        venue.dogFriendly || venue.petsAllowedIndoors
+          ? "dog pet friendly"
+          : null,
         venue.hasAncHeadsetRental ? "noise cancelling headset" : null,
       ]
         .filter(Boolean)

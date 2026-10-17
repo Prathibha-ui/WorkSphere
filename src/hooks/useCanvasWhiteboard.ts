@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/exhaustive-deps */
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -5,6 +6,15 @@ import { useAuth } from "@clerk/nextjs";
 import * as Y from "yjs";
 import YProvider from "y-partykit/provider";
 import { FailoverSyncManager } from "@/lib/edge/failoverSync";
+
+import {
+  type ConstructType,
+  renderConstructToCanvas,
+  renderConstructSvg,
+} from "@/lib/whiteboard/constructGenerator";
+
+export { type ConstructType, renderConstructToCanvas, renderConstructSvg };
+
 import {
   type ToolType,
   type ShapeData,
@@ -17,6 +27,7 @@ import {
   PARTYKIT_HOST,
   IDLE_TIMEOUT_MS,
   HEARTBEAT_INTERVAL_MS,
+  THROTTLE_INTERVAL_MS,
   WHITEBOARD_COLOR_SWATCHES,
   PRESET_COLORS,
   WHITEBOARD_COLORS,
@@ -43,6 +54,7 @@ export {
   PARTYKIT_HOST,
   IDLE_TIMEOUT_MS,
   HEARTBEAT_INTERVAL_MS,
+  THROTTLE_INTERVAL_MS,
   WHITEBOARD_COLOR_SWATCHES,
   PRESET_COLORS,
   WHITEBOARD_COLORS,
@@ -177,13 +189,19 @@ export function useCanvasWhiteboard(
         if (status === "disconnected") {
           failoverSync.handleDisconnect();
           setIsConnected(false);
+        } else if (status === "connected") {
+          const sendFn = (msg: string) => {
+            if (newProvider?.ws) {
+              newProvider.ws.send(msg);
+            }
+          };
+          failoverSync.handleConnect(sendFn, roomId);
         }
       };
       newProvider.on("status", handleStatus);
 
       handleSync = (synced: boolean) => {
-        if (synced) {
-          failoverSync.handleSync();
+        if (synced && failoverSync.getStatus() !== "syncing_snapshot") {
           setIsConnected(true);
         }
       };
@@ -250,7 +268,10 @@ export function useCanvasWhiteboard(
       if (!awareness) return;
       const currentTime = Date.now();
       if (currentTime - lastActiveAtRef.current > IDLE_TIMEOUT_MS) {
-        const local = awareness.getLocalState() as Record<string, unknown> | null;
+        const local = awareness.getLocalState() as Record<
+          string,
+          unknown
+        > | null;
         if (local && local.status !== "idle") {
           awareness.setLocalState({
             ...local,
@@ -346,7 +367,9 @@ export function useCanvasWhiteboard(
           if (item) {
             prevShape = { ...item };
             return prev.map((s) =>
-              s.id === id ? { ...s, ...updates, updatedAt: now, clock: now } : s,
+              s.id === id
+                ? { ...s, ...updates, updatedAt: now, clock: now }
+                : s,
             );
           }
           return prev;

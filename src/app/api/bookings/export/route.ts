@@ -9,6 +9,7 @@ import {
 } from "@/lib/pdfHelpers";
 import { resolveDateRange, filterBookingsByRange } from "@/lib/taxExport";
 import { generateTaxExportPdf } from "@/lib/pdfGenerator";
+import { generateBookingsExcel } from "@/lib/export/domain/bookingHistoryExporter";
 
 export async function POST(req: NextRequest) {
   try {

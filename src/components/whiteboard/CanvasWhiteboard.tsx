@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useUser } from "@clerk/nextjs";
 import { useMeshCanvasWhiteboard } from "@/hooks/useMeshCanvasWhiteboard";
 import { CanvasToolbar } from "@/components/whiteboard/CanvasToolbar";
@@ -12,6 +12,7 @@ import {
   exportCanvasAsPng,
   exportCanvasAsSvg,
 } from "@/lib/whiteboard/canvasExport";
+import type { ConstructType } from "@/lib/whiteboard/constructGenerator";
 
 interface CanvasWhiteboardProps {
   canvasId: string;
@@ -27,6 +28,7 @@ export function CanvasWhiteboard({ canvasId }: CanvasWhiteboardProps) {
 
   const userAvatar = user?.imageUrl;
   const [isShortcutModalOpen, setIsShortcutModalOpen] = useState(false);
+  const [constructType, setConstructType] = useState<ConstructType>("shield");
 
   const {
     shapeSnapshots,
@@ -46,6 +48,9 @@ export function CanvasWhiteboard({ canvasId }: CanvasWhiteboardProps) {
     clearCanvas,
     addShape,
     updateShape,
+    acquireNoteLease,
+    releaseNoteLease,
+    noteLeaseOwners,
     updateCursor,
   } = useMeshCanvasWhiteboard(canvasId, {
     userName,
@@ -53,6 +58,58 @@ export function CanvasWhiteboard({ canvasId }: CanvasWhiteboardProps) {
     userId,
     userAvatar,
   });
+
+  // Batch and throttle pointer/cursor coordinates to 30ms intervals.
+  // This decouples local 60fps canvas stroke rendering from network
+  // awareness serialization, JSON stringification, and React state dispatches.
+  const THROTTLE_INTERVAL_MS = 30; // 30ms throttle buffer (~33 updates/sec max)
+  const lastCursorBroadcastRef = useRef<number>(-THROTTLE_INTERVAL_MS);
+  const cursorBufferRef = useRef<{ x: number; y: number } | null>(null);
+  const cursorThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+
+  const handleCursorMove = useCallback(
+    (x: number, y: number) => {
+      cursorBufferRef.current = { x, y };
+      const now = performance.now();
+
+      if (now - lastCursorBroadcastRef.current >= THROTTLE_INTERVAL_MS) {
+        lastCursorBroadcastRef.current = now;
+        if (cursorThrottleTimerRef.current !== null) {
+          clearTimeout(cursorThrottleTimerRef.current);
+          cursorThrottleTimerRef.current = null;
+        }
+        updateCursor(x, y);
+      } else if (!cursorThrottleTimerRef.current) {
+        const remaining =
+          THROTTLE_INTERVAL_MS - (now - lastCursorBroadcastRef.current);
+        cursorThrottleTimerRef.current = setTimeout(
+          () => {
+            cursorThrottleTimerRef.current = null;
+            lastCursorBroadcastRef.current = performance.now();
+            if (cursorBufferRef.current) {
+              updateCursor(
+                cursorBufferRef.current.x,
+                cursorBufferRef.current.y,
+              );
+            }
+          },
+          Math.max(0, remaining),
+        );
+      }
+    },
+    [updateCursor],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (cursorThrottleTimerRef.current !== null) {
+        clearTimeout(cursorThrottleTimerRef.current);
+        cursorThrottleTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const handleAddShape = useCallback(
     (shape: Parameters<typeof addShape>[0]) => addShape(shape),
@@ -70,12 +127,15 @@ export function CanvasWhiteboard({ canvasId }: CanvasWhiteboardProps) {
     setTool("pen");
   }, [clearCanvas, setTool]);
 
-  const handleExportPNG = useCallback((ratio?: 1 | 2 | 4) => {
-    exportCanvasAsPng(shapeSnapshots, {
-      pixelRatio: ratio ?? 2,
-      filename: `whiteboard-${canvasId || "export"}-${Date.now()}.png`,
-    });
-  }, [shapeSnapshots, canvasId]);
+  const handleExportPNG = useCallback(
+    (ratio?: 1 | 2 | 4) => {
+      exportCanvasAsPng(shapeSnapshots, {
+        pixelRatio: ratio ?? 2,
+        filename: `whiteboard-${canvasId || "export"}-${Date.now()}.png`,
+      });
+    },
+    [shapeSnapshots, canvasId],
+  );
 
   const handleExportSVG = useCallback(() => {
     exportCanvasAsSvg(shapeSnapshots, {
@@ -114,6 +174,9 @@ export function CanvasWhiteboard({ canvasId }: CanvasWhiteboardProps) {
         } else if (key === "n") {
           e.preventDefault();
           setTool("sticky");
+        } else if (key === "c") {
+          e.preventDefault();
+          setTool("construct");
         }
       }
     };
@@ -135,9 +198,11 @@ export function CanvasWhiteboard({ canvasId }: CanvasWhiteboardProps) {
           canRedo={canRedo}
           isConnected={isConnected}
           participants={participants}
+          constructType={constructType}
           onToolChange={setTool}
           onColorChange={setColor}
           onStrokeWidthChange={setStrokeWidth}
+          onConstructTypeChange={setConstructType}
           onUndo={undo}
           onRedo={redo}
           onClear={handleClear}
@@ -155,14 +220,19 @@ export function CanvasWhiteboard({ canvasId }: CanvasWhiteboardProps) {
           tool={tool}
           color={color}
           strokeWidth={strokeWidth}
+          constructType={constructType}
           onAddShape={handleAddShape}
           onUpdateShape={handleUpdateShape}
-          onCursorMove={updateCursor}
+          onCursorMove={handleCursorMove}
           userId={userId}
         />
         <StickyNotes
           notes={shapeSnapshots.filter((shape) => shape.type === "sticky")}
           onUpdate={handleUpdateShape}
+          onAcquireLease={acquireNoteLease}
+          onReleaseLease={releaseNoteLease}
+          noteLeaseOwners={noteLeaseOwners}
+          userId={userId}
         />
       </div>
 

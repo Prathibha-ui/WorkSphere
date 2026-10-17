@@ -48,15 +48,27 @@ export interface MapMarker {
     specialtyEspresso?: boolean;
     oatAlmondMilk?: boolean;
     pourOverAvailable?: boolean;
+    circadianLighting?: boolean;
+    lighting?: string;
   };
+  hasCircadianLighting?: boolean;
+  circadianLighting?: boolean;
 }
 
 export interface MapRoute {
   id: string;
-  path: Array<{ lat: number; lng: number }>;
+  name?: string;
+  path: Array<{ lat: number; lng: number; elevationMeters?: number }>;
   distance?: number;
   duration?: number;
   isHighlighted?: boolean;
+  elevationGainMeters?: number;
+  elevationLossMeters?: number;
+  elevationProfile?: Array<{
+    distanceKm: number;
+    elevationMeters: number;
+    gradePercent?: number;
+  }>;
 }
 
 export interface MapView {

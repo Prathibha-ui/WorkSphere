@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/exhaustive-deps */
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -15,6 +16,7 @@ import {
   type ShapeData,
   type RemoteCursor,
   type CanvasWhiteboardState,
+  type NoteLeaseControls,
   type WhiteboardParticipant,
   type UseCanvasWhiteboardOptions,
   PARTYKIT_HOST,
@@ -39,10 +41,17 @@ import {
  */
 export const meshSendTimestamps = new Map<string, number>();
 
+const NOTE_LEASE_REQUEST_TIMEOUT_MS = 3000;
+
+interface PendingNoteLease {
+  resolve: (granted: boolean) => void;
+  timeout: ReturnType<typeof setTimeout>;
+}
+
 export function useMeshCanvasWhiteboard(
   canvasId: string | null,
   options?: UseCanvasWhiteboardOptions,
-): CanvasWhiteboardState {
+): CanvasWhiteboardState & NoteLeaseControls {
   const { getToken } = useAuth();
   const [token, setToken] = useState<string | null>(null);
   const [provider, setProvider] = useState<YProvider | null>(null);
@@ -60,6 +69,12 @@ export function useMeshCanvasWhiteboard(
   const meshConnectedRef = useRef<boolean>(false);
 
   const [shapeSnapshots, setShapeSnapshots] = useState<ShapeData[]>([]);
+  const [noteLeaseOwners, setNoteLeaseOwners] = useState<
+    Record<string, string>
+  >({});
+  const noteLeaseOwnersRef = useRef<Map<string, string>>(new Map());
+  const pendingNoteLeasesRef = useRef<Map<string, PendingNoteLease>>(new Map());
+  const nextNoteLeaseRequestRef = useRef(0);
   const [remoteCursors, setRemoteCursors] = useState<RemoteCursor[]>([]);
   const [participants, setParticipants] = useState<WhiteboardParticipant[]>([]);
   const lastActiveAtRef = useRef<number>(Date.now());
@@ -75,6 +90,101 @@ export function useMeshCanvasWhiteboard(
   const userAvatar = options?.userAvatar;
   const localUserId = options?.userId ?? "anonymous";
 
+  const meshRoomId = canvasId ? `canvas-${canvasId}` : "canvas-none";
+
+  const setNoteLeaseOwner = useCallback(
+    (noteId: string, ownerId: string | null) => {
+      if (ownerId) {
+        noteLeaseOwnersRef.current.set(noteId, ownerId);
+      } else {
+        noteLeaseOwnersRef.current.delete(noteId);
+      }
+      setNoteLeaseOwners(Object.fromEntries(noteLeaseOwnersRef.current));
+    },
+    [],
+  );
+
+  const acquireNoteLease = useCallback(
+    (noteId: string) => {
+      const socket = providerRef.current?.ws;
+      if (!socket || socket.readyState !== 1) return Promise.resolve(false);
+
+      const requestId = `${Date.now()}-${nextNoteLeaseRequestRef.current++}`;
+      return new Promise<boolean>((resolve) => {
+        const timeout = setTimeout(() => {
+          pendingNoteLeasesRef.current.delete(requestId);
+          resolve(false);
+        }, NOTE_LEASE_REQUEST_TIMEOUT_MS);
+        pendingNoteLeasesRef.current.set(requestId, { resolve, timeout });
+
+        try {
+          socket.send(
+            JSON.stringify({
+              type: "HOLD_NOTE",
+              payload: { noteId, userId: localUserId, requestId },
+            }),
+          );
+        } catch (error) {
+          clearTimeout(timeout);
+          pendingNoteLeasesRef.current.delete(requestId);
+          console.error("Failed to request sticky note lease:", error);
+          resolve(false);
+        }
+      });
+    },
+    [localUserId],
+  );
+
+  const releaseNoteLease = useCallback(
+    (noteId: string) => {
+      const socket = providerRef.current?.ws;
+      if (!socket || socket.readyState !== 1) return;
+      try {
+        socket.send(
+          JSON.stringify({ type: "RELEASE_NOTE", payload: { noteId } }),
+        );
+        setNoteLeaseOwner(noteId, null);
+      } catch (error) {
+        console.error("Failed to release sticky note lease:", error);
+      }
+    },
+    [setNoteLeaseOwner],
+  );
+
+  const onMeshData = useCallback((peerId: string, data: ArrayBuffer) => {
+    const doc = docRef.current;
+    if (!doc) return;
+    try {
+      const rawUpdate = new Uint8Array(data);
+      const decompressed = decompressYjsUpdate(rawUpdate);
+      Y.applyUpdate(doc, decompressed, "mesh");
+    } catch (err) {
+      console.warn("Failed to apply mesh update from", peerId, err);
+    }
+  }, []);
+
+  const mesh = useMeshDataChannels({
+    roomId: meshRoomId,
+    userId: localUserId !== "anonymous" ? localUserId : null,
+    onData: onMeshData,
+  });
+
+  // Issue #1318: Keep meshConnectedRef in sync with the reactive mesh state
+  // so the doc update handler always reads the latest connectivity status.
+  useEffect(() => {
+    meshConnectedRef.current = mesh.isConnected;
+  }, [mesh.isConnected]);
+
+  useEffect(() => {
+    if (!canvasId) return;
+
+    if (typeof getToken === "function") {
+      getToken()
+        .then((t: any) => setToken(t ?? null))
+        .catch(() => setToken(null));
+    }
+  }, [canvasId, getToken]);
+
   const touchActivity = useCallback(() => {
     lastActiveAtRef.current = Date.now();
     const p = providerRef.current;
@@ -89,61 +199,6 @@ export function useMeshCanvasWhiteboard(
       });
     }
   }, []);
-
-  // WebRTC mesh data channel integration
-  const mesh = useMeshDataChannels({
-    channelName: canvasId ? `mesh-${canvasId}` : null,
-    onData: (payload: unknown) => {
-      if (
-        !payload ||
-        typeof payload !== "object" ||
-        (payload as { type?: string }).type !== "yjs-update"
-      ) {
-        return;
-      }
-
-      const msg = payload as {
-        type: "yjs-update";
-        update: string;
-        compressed?: boolean;
-        updateId?: string;
-        sentAt?: number;
-      };
-
-      if (typeof msg.update !== "string") return;
-
-      const doc = docRef.current;
-      if (!doc) return;
-
-      try {
-        const updateBinary =
-          msg.compressed === false
-            ? Uint8Array.from(atob(msg.update), (c) => c.charCodeAt(0))
-            : decompressYjsUpdate(msg.update);
-
-        if (msg.updateId && meshSendTimestamps.has(msg.updateId)) {
-          meshSendTimestamps.set(msg.updateId, performance.now());
-        }
-
-        Y.applyUpdate(doc, updateBinary, "mesh");
-      } catch (err) {
-        console.error(
-          "[useMeshCanvasWhiteboard] failed to apply mesh update:",
-          err,
-        );
-      }
-    },
-  });
-
-  meshConnectedRef.current = mesh.isConnected;
-
-  useEffect(() => {
-    if (!canvasId) return;
-
-    getToken()
-      .then((t) => setToken(t ?? null))
-      .catch(() => setToken(null));
-  }, [canvasId, getToken]);
 
   // Stroke point applier shared between buffered & immediate dispatch
   const applyShapePoints = useCallback(
@@ -162,9 +217,19 @@ export function useMeshCanvasWhiteboard(
   const {
     strokeBufferRef,
     flushStrokeBuffer,
-    broadcastStroke,
+    broadcastStroke: bufferStroke,
     bufferStrokePoints,
   } = useStrokeBuffer({ onApplyPoints: applyShapePoints });
+
+  const broadcastStroke = useCallback(
+    (id: string, points: number[]) => {
+      // A note held by another participant must not move under their cursor.
+      const leaseOwner = noteLeaseOwnersRef.current.get(id);
+      if (leaseOwner && leaseOwner !== localUserId) return;
+      bufferStroke(id, points);
+    },
+    [localUserId, bufferStroke],
+  );
 
   useEffect(() => {
     if (!canvasId || token === undefined) return;
@@ -175,6 +240,8 @@ export function useMeshCanvasWhiteboard(
     let newProvider: YProvider | null = null;
     let handleStatus: (({ status }: { status: string }) => void) | null = null;
     let handleSync: ((synced: boolean) => void) | null = null;
+    let leaseSocket: WebSocket | null = null;
+    let handleNoteMessage: ((event: MessageEvent) => void) | null = null;
 
     try {
       newProvider = new YProvider(PARTYKIT_HOST, roomId, doc, {
@@ -195,13 +262,55 @@ export function useMeshCanvasWhiteboard(
         if (status === "disconnected") {
           failoverSync.handleDisconnect();
           setIsConnected(false);
+        } else if (status === "connected") {
+          const socket = newProvider?.ws;
+          if (socket && socket !== leaseSocket) {
+            if (leaseSocket && handleNoteMessage) {
+              leaseSocket.removeEventListener("message", handleNoteMessage);
+            }
+            leaseSocket = socket;
+            handleNoteMessage = (event: MessageEvent) => {
+              if (typeof event.data !== "string") return;
+              try {
+                const message = JSON.parse(event.data);
+                if (message.type === "NOTE_LOCK_STATE") {
+                  const { noteId, ownerUserId } = message.payload ?? {};
+                  if (typeof noteId === "string") {
+                    setNoteLeaseOwner(
+                      noteId,
+                      typeof ownerUserId === "string" ? ownerUserId : null,
+                    );
+                  }
+                } else if (
+                  message.type === "NOTE_LOCK_GRANTED" ||
+                  message.type === "NOTE_LOCK_DENIED"
+                ) {
+                  const requestId = message.payload?.requestId;
+                  const pending = pendingNoteLeasesRef.current.get(requestId);
+                  if (pending) {
+                    clearTimeout(pending.timeout);
+                    pendingNoteLeasesRef.current.delete(requestId);
+                    pending.resolve(message.type === "NOTE_LOCK_GRANTED");
+                  }
+                }
+              } catch {
+                // Other websocket frames belong to the Yjs provider protocol.
+              }
+            };
+            socket.addEventListener("message", handleNoteMessage);
+          }
+          const sendFn = (msg: string) => {
+            if (newProvider?.ws) {
+              newProvider.ws.send(msg);
+            }
+          };
+          failoverSync.handleConnect(sendFn, roomId);
         }
       };
       newProvider.on("status", handleStatus);
 
       handleSync = (synced: boolean) => {
-        if (synced) {
-          failoverSync.handleSync();
+        if (synced && failoverSync.getStatus() !== "syncing_snapshot") {
           setIsConnected(true);
         }
       };
@@ -224,30 +333,6 @@ export function useMeshCanvasWhiteboard(
     shapes.observeDeep(updateSnapshots);
     updateSnapshots();
 
-    // Hook up local Yjs update distribution via WebRTC Data Channels
-    const handleDocUpdate = (update: Uint8Array, origin: unknown) => {
-      if (origin === "mesh") return;
-
-      if (meshConnectedRef.current) {
-        const updateId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-        meshSendTimestamps.set(updateId, performance.now());
-
-        const compressedBase64 = compressYjsUpdate(update);
-        mesh.sendToAll({
-          type: "yjs-update",
-          update: compressedBase64,
-          compressed: true,
-          updateId,
-          sentAt: Date.now(),
-        });
-      }
-    };
-
-    doc.on("update", handleDocUpdate);
-    unsubDocUpdateRef.current = () => {
-      doc.off("update", handleDocUpdate);
-    };
-
     const um = new Y.UndoManager(shapes, {
       trackedOrigins: new Set([localUserId]),
     });
@@ -261,6 +346,44 @@ export function useMeshCanvasWhiteboard(
     um.on("stack-item-added", updateUndoState);
     um.on("stack-item-popped", updateUndoState);
     updateUndoState();
+
+    // Issue #1318: local edits (direct actions or local undo/redo) are also
+    // relayed over the WebRTC mesh when it is connected. Updates that arrived
+    // from the mesh or the y-partykit provider are never re-broadcast, which
+    // would echo them. PartyKit stays the authoritative sync channel.
+    const sendToAll = mesh.sendToAll;
+    const handleDocUpdate = (update: Uint8Array, origin: unknown) => {
+      if (origin === "mesh") return;
+      if (origin !== localUserId && origin !== um) return;
+      if (!meshConnectedRef.current) return;
+
+      const compressed = compressYjsUpdate(update);
+      meshSendTimestamps.set(
+        `${Date.now()}-${update.byteLength}`,
+        performance.now(),
+      );
+      // Bound the benchmarking map so long sessions do not leak.
+      if (meshSendTimestamps.size > 1000) {
+        const firstKey = meshSendTimestamps.keys().next().value;
+        if (firstKey !== undefined) meshSendTimestamps.delete(firstKey);
+      }
+      // compressYjsUpdate may return a view into a larger allocation.
+      const exactBuffer = (
+        compressed.byteOffset === 0 &&
+        compressed.byteLength === compressed.buffer.byteLength
+          ? compressed.buffer
+          : compressed.buffer.slice(
+              compressed.byteOffset,
+              compressed.byteOffset + compressed.byteLength,
+            )
+      ) as ArrayBuffer;
+      sendToAll(exactBuffer);
+    };
+
+    doc.on("update", handleDocUpdate);
+    unsubDocUpdateRef.current = () => {
+      doc.off("update", handleDocUpdate);
+    };
 
     const awareness = newProvider?.awareness;
     const initNow = Date.now();
@@ -293,7 +416,10 @@ export function useMeshCanvasWhiteboard(
       if (!awareness) return;
       const currentTime = Date.now();
       if (currentTime - lastActiveAtRef.current > IDLE_TIMEOUT_MS) {
-        const local = awareness.getLocalState() as Record<string, unknown> | null;
+        const local = awareness.getLocalState() as Record<
+          string,
+          unknown
+        > | null;
         if (local && local.status !== "idle") {
           awareness.setLocalState({
             ...local,
@@ -316,8 +442,17 @@ export function useMeshCanvasWhiteboard(
       if (newProvider) {
         if (handleStatus) newProvider.off("status", handleStatus);
         if (handleSync) newProvider.off("sync", handleSync);
+        if (leaseSocket && handleNoteMessage) {
+          leaseSocket.removeEventListener("message", handleNoteMessage);
+        }
         newProvider.disconnect();
       }
+      for (const pending of pendingNoteLeasesRef.current.values()) {
+        clearTimeout(pending.timeout);
+        pending.resolve(false);
+      }
+      pendingNoteLeasesRef.current.clear();
+      noteLeaseOwnersRef.current.clear();
       doc.destroy();
       shapesRef.current = null;
       docRef.current = null;
@@ -333,6 +468,7 @@ export function useMeshCanvasWhiteboard(
     userAvatar,
     localUserId,
     mesh.sendToAll,
+    setNoteLeaseOwner,
     flushStrokeBuffer,
     strokeBufferRef,
   ]);
@@ -347,6 +483,8 @@ export function useMeshCanvasWhiteboard(
 
   const updateShape = useCallback(
     (id: string, updates: Partial<ShapeData>) => {
+      const leaseOwner = noteLeaseOwnersRef.current.get(id);
+      if (leaseOwner && leaseOwner !== localUserId) return;
       const keys = Object.keys(updates);
       if (
         updates.points !== undefined &&
@@ -414,11 +552,14 @@ export function useMeshCanvasWhiteboard(
   return {
     addShape,
     updateShape,
+    acquireNoteLease,
+    releaseNoteLease,
     deleteShape,
     broadcastStroke,
     bufferStrokePoints,
     flushStrokeBuffer,
     shapeSnapshots,
+    noteLeaseOwners,
     remoteCursors,
     participants,
     tool,

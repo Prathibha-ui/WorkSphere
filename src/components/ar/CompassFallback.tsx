@@ -21,6 +21,37 @@ import {
   X,
 } from "lucide-react";
 import { CompassKalmanFilter } from "@/lib/spatial/compassFilter";
+import {
+  QuaternionOrientationFilter,
+  isGimbalLockProne,
+} from "@/lib/spatial/quaternionOrientation";
+
+/**
+ * Calculates pitch and roll from device beta and gamma orientation angles.
+ */
+export function calculatePitchAndRoll(
+  beta: number | null | undefined,
+  gamma: number | null | undefined
+): { pitch: number; roll: number } {
+  const rawBeta = beta ?? 0;
+  const rawGamma = gamma ?? 0;
+
+  const pitch = Math.max(-90, Math.min(90, rawBeta));
+  const roll = Math.max(-90, Math.min(90, rawGamma));
+
+  return { pitch, roll };
+}
+
+/**
+ * Low-pass filter to dampen hand tremor jitter.
+ */
+export function applyLowPassFilter(
+  current: number,
+  target: number,
+  alpha: number = 0.25
+): number {
+  return current + alpha * (target - current);
+}
 
 interface CompassFallbackProps {
   destinationLat?: number | null;
@@ -31,6 +62,11 @@ interface CompassFallbackProps {
   trapFocus?: boolean;
   kalmanQ?: number;
   kalmanR?: number;
+  slerpFactor?: number;
+  alpha?: number | null;
+  beta?: number | null;
+  gamma?: number | null;
+  showPitchLadder?: boolean;
 }
 
 interface UserCoordinates {
@@ -48,6 +84,11 @@ export default function CompassFallback({
   trapFocus = true,
   kalmanQ = 0.05,
   kalmanR = 0.5,
+  slerpFactor = 0.2,
+  alpha,
+  beta,
+  gamma,
+  showPitchLadder = true,
 }: CompassFallbackProps) {
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -58,14 +99,40 @@ export default function CompassFallback({
   const {
     heading,
     accuracy,
+    alpha: hookAlpha,
+    beta: hookBeta,
+    gamma: hookGamma,
     error: orientationError,
     isSupported,
     permissionState,
     requestPermission,
   } = useDeviceOrientation();
 
+  const effectiveAlpha = alpha !== undefined ? alpha : hookAlpha;
+  const effectiveBeta = beta !== undefined ? beta : hookBeta;
+  const effectiveGamma = gamma !== undefined ? gamma : hookGamma;
+  const isGimbalLockActive = isGimbalLockProne(effectiveBeta);
+
+  // HUD Pitch Ladder & Artificial Horizon Low-pass Filter State
+  const [hudPitch, setHudPitch] = useState<number>(0);
+  const [hudRoll, setHudRoll] = useState<number>(0);
+  const hudPitchRef = useRef<number>(0);
+  const hudRollRef = useRef<number>(0);
+
+  useEffect(() => {
+    const { pitch, roll } = calculatePitchAndRoll(effectiveBeta, effectiveGamma);
+    const smoothedPitch = applyLowPassFilter(hudPitchRef.current, pitch, 0.25);
+    const smoothedRoll = applyLowPassFilter(hudRollRef.current, roll, 0.25);
+
+    hudPitchRef.current = smoothedPitch;
+    hudRollRef.current = smoothedRoll;
+    setHudPitch(Number(smoothedPitch.toFixed(1)));
+    setHudRoll(Number(smoothedRoll.toFixed(1)));
+  }, [effectiveBeta, effectiveGamma]);
+
   const [filteredHeading, setFilteredHeading] = useState<number | null>(null);
   const kalmanFilterRef = useRef<CompassKalmanFilter | null>(null);
+  const quaternionFilterRef = useRef<QuaternionOrientationFilter | null>(null);
 
   if (!kalmanFilterRef.current) {
     kalmanFilterRef.current = new CompassKalmanFilter({
@@ -74,20 +141,46 @@ export default function CompassFallback({
     });
   }
 
+  if (!quaternionFilterRef.current) {
+    quaternionFilterRef.current = new QuaternionOrientationFilter(slerpFactor);
+  }
+
   useEffect(() => {
     kalmanFilterRef.current?.setParameters({ q: kalmanQ, r: kalmanR });
   }, [kalmanQ, kalmanR]);
 
   useEffect(() => {
-    if (heading !== null && !isNaN(heading)) {
-      const smoothed = kalmanFilterRef.current?.update(heading, accuracy);
+    quaternionFilterRef.current?.setSlerpFactor(slerpFactor);
+  }, [slerpFactor]);
+
+  useEffect(() => {
+    let rawHeading: number | null = null;
+
+    if (
+      effectiveAlpha !== null &&
+      effectiveAlpha !== undefined &&
+      Number.isFinite(effectiveAlpha)
+    ) {
+      rawHeading =
+        quaternionFilterRef.current?.update(
+          effectiveAlpha,
+          effectiveBeta,
+          effectiveGamma,
+        ) ?? null;
+    } else if (heading !== null && !isNaN(heading)) {
+      rawHeading = heading;
+    }
+
+    if (rawHeading !== null && !isNaN(rawHeading)) {
+      const smoothed = kalmanFilterRef.current?.update(rawHeading, accuracy);
       if (smoothed !== null && smoothed !== undefined) {
         setFilteredHeading(Math.round(smoothed * 10) / 10);
       }
     } else {
+      quaternionFilterRef.current?.reset();
       setFilteredHeading(null);
     }
-  }, [heading, accuracy]);
+  }, [effectiveAlpha, effectiveBeta, effectiveGamma, heading, accuracy]);
 
   const activeHeading = filteredHeading !== null ? filteredHeading : heading;
 
@@ -200,6 +293,16 @@ export default function CompassFallback({
           </span>
           <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-blue-500/20 text-blue-300 border border-blue-500/30">
             2D Compass Fallback
+          </span>
+          <span
+            data-testid="quaternion-stabilization-badge"
+            className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium border ${
+              isGimbalLockActive
+                ? "bg-purple-500/20 text-purple-300 border-purple-500/40 animate-pulse"
+                : "bg-emerald-500/20 text-emerald-300 border-emerald-500/30"
+            }`}
+          >
+            {isGimbalLockActive ? "Gimbal Lock Protected" : "Quaternion SLERP"}
           </span>
         </div>
 
@@ -344,6 +447,80 @@ export default function CompassFallback({
             </div>
           </div>
 
+          {/* Fighter Jet Cockpit HUD Pitch Ladder (+10°, 0° horizon, -10°) */}
+          {showPitchLadder && (
+            <svg
+              data-testid="hud-pitch-ladder"
+              className="absolute inset-0 w-full h-full pointer-events-none select-none z-10"
+              viewBox="-100 -100 200 200"
+            >
+              <defs>
+                <filter id="hud-emerald-glow" x="-20%" y="-20%" width="140%" height="140%">
+                  <feGaussianBlur stdDeviation="1" result="blur" />
+                  <feMerge>
+                    <feMergeNode in="blur" />
+                    <feMergeNode in="SourceGraphic" />
+                  </feMerge>
+                </filter>
+              </defs>
+
+              {/* Pitch Ladder & Horizon Group (tilts with pitch translation and roll rotation) */}
+              <g
+                data-testid="hud-horizon-group"
+                transform={`rotate(${-hudRoll}) translate(0, ${hudPitch * 2})`}
+                filter="url(#hud-emerald-glow)"
+              >
+                {/* +10° Pitch Rung */}
+                <g data-testid="pitch-rung-plus-10" transform="translate(0, -32)">
+                  <line x1="-38" y1="0" x2="-12" y2="0" stroke="#10b981" strokeWidth="1.5" />
+                  <line x1="-38" y1="0" x2="-38" y2="5" stroke="#10b981" strokeWidth="1.5" />
+                  <text x="-44" y="3" fill="#34d399" fontSize="8" fontFamily="monospace" textAnchor="end">
+                    +10
+                  </text>
+                  <line x1="12" y1="0" x2="38" y2="0" stroke="#10b981" strokeWidth="1.5" />
+                  <line x1="38" y1="0" x2="38" y2="5" stroke="#10b981" strokeWidth="1.5" />
+                  <text x="44" y="3" fill="#34d399" fontSize="8" fontFamily="monospace" textAnchor="start">
+                    +10
+                  </text>
+                </g>
+
+                {/* 0° Artificial Horizon Line */}
+                <g data-testid="pitch-rung-horizon" transform="translate(0, 0)">
+                  <line x1="-65" y1="0" x2="-14" y2="0" stroke="#10b981" strokeWidth="2" />
+                  <line x1="14" y1="0" x2="65" y2="0" stroke="#10b981" strokeWidth="2" />
+                  <text x="-70" y="3" fill="#10b981" fontSize="9" fontFamily="monospace" fontWeight="bold" textAnchor="end">
+                    0°
+                  </text>
+                  <text x="70" y="3" fill="#10b981" fontSize="9" fontFamily="monospace" fontWeight="bold" textAnchor="start">
+                    0°
+                  </text>
+                </g>
+
+                {/* -10° Pitch Rung */}
+                <g data-testid="pitch-rung-minus-10" transform="translate(0, 32)">
+                  <line x1="-38" y1="0" x2="-12" y2="0" stroke="#10b981" strokeWidth="1.5" strokeDasharray="4 2" />
+                  <line x1="-38" y1="0" x2="-38" y2="-5" stroke="#10b981" strokeWidth="1.5" />
+                  <text x="-44" y="3" fill="#34d399" fontSize="8" fontFamily="monospace" textAnchor="end">
+                    -10
+                  </text>
+                  <line x1="12" y1="0" x2="38" y2="0" stroke="#10b981" strokeWidth="1.5" strokeDasharray="4 2" />
+                  <line x1="38" y1="0" x2="38" y2="-5" stroke="#10b981" strokeWidth="1.5" />
+                  <text x="44" y="3" fill="#34d399" fontSize="8" fontFamily="monospace" textAnchor="start">
+                    -10
+                  </text>
+                </g>
+              </g>
+
+              {/* Stationary Aircraft Boresight Reference in Center */}
+              <g data-testid="hud-boresight" filter="url(#hud-emerald-glow)">
+                <circle cx="0" cy="0" r="1.5" fill="#10b981" />
+                <line x1="-12" y1="0" x2="-4" y2="0" stroke="#10b981" strokeWidth="1.5" />
+                <line x1="4" y1="0" x2="12" y2="0" stroke="#10b981" strokeWidth="1.5" />
+                <line x1="0" y1="-6" x2="0" y2="-2" stroke="#10b981" strokeWidth="1.5" />
+              </g>
+            </svg>
+          )}
+
           {/* Center Pin */}
           <div className="absolute w-5 h-5 bg-slate-300 rounded-full border-2 border-slate-900 shadow-md flex items-center justify-center z-20">
             <div className="w-1.5 h-1.5 bg-blue-600 rounded-full" />
@@ -377,7 +554,10 @@ export default function CompassFallback({
 
           {/* Heading Readout */}
           <div className="flex items-center gap-3 font-mono text-xs text-slate-400">
-            <span className="bg-slate-800/80 px-2.5 py-1 rounded-md border border-slate-700/60">
+            <span
+              data-testid="heading-readout"
+              className="bg-slate-800/80 px-2.5 py-1 rounded-md border border-slate-700/60"
+            >
               Heading:{" "}
               <strong className="text-white">
                 {activeHeading !== null
@@ -392,6 +572,30 @@ export default function CompassFallback({
                 Bearing:{" "}
                 <strong className="text-white">
                   {Math.round(targetBearing)}°
+                </strong>
+              </span>
+            )}
+
+            {effectiveBeta !== null && effectiveBeta !== undefined && (
+              <span
+                data-testid="pitch-readout"
+                className="bg-slate-800/80 px-2.5 py-1 rounded-md border border-slate-700/60"
+              >
+                Pitch:{" "}
+                <strong className="text-white">
+                  {Math.round(effectiveBeta)}°
+                </strong>
+              </span>
+            )}
+
+            {effectiveGamma !== null && effectiveGamma !== undefined && (
+              <span
+                data-testid="roll-readout"
+                className="bg-slate-800/80 px-2.5 py-1 rounded-md border border-slate-700/60"
+              >
+                Roll:{" "}
+                <strong className="text-white">
+                  {Math.round(effectiveGamma)}°
                 </strong>
               </span>
             )}
